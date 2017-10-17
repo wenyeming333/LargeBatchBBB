@@ -1,5 +1,5 @@
 # LargeBatchBBB
-The flip_bbb.py file has a tabular_logger dependency which uses python3. To use python2, just comment out everything that dependson it.
+The flip_bbb.py file has a tabular_logger dependency which uses python3. To use python2, just comment out everything that depends on it.
 To run the large batch BBB, 
 
 ```
