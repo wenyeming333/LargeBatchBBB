@@ -2,6 +2,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from tensorflow.contrib.layers.python.layers import initializers
 from tensorflow.examples.tutorials.mnist import input_data
 import tabular_logger as tlogger
 import tensorflow as tf
@@ -29,6 +30,11 @@ def log_prior(x, isScaled=True):
   else:
     sigma = tf.exp(-1.0)
     return log_normal(x, 0.0, sigma)
+
+def max_pool_2x2(x):
+  """max_pool_2x2 downsamples a feature map by 2X."""
+  return tf.nn.max_pool(x, ksize=[1, 2, 2, 1],
+                        strides=[1, 2, 2, 1], padding='SAME')
 
 class bayes():
   def __init__(self, args):
@@ -86,7 +92,7 @@ class bayes():
       return tf.cond(isTrain, lambda: train_forward(), lambda: map_inference())
 
   # Only be called during training.
-  def flipoutlayerFC(self, x, W_0, delta_W):
+  def flipoutFC(self, x, W_0, delta_W):
     weight_dim = W_0.shape.as_list()
     # x is n*m where m is the dimension, n is the mini-batch size.
     # W_0 is m*h where h is the num of hidden units.
@@ -126,9 +132,8 @@ class bayes():
         with tf.name_scope('perturbation'):
           epsilon_w = tf.random_normal([input_dim, output_dim], stddev=1.0)
           delta_W = tf.multiply(sigma_w, epsilon_w)
-          weights = mu_w + delta_W
         with tf.name_scope('flipout'):
-          flipoutFC = self.flipoutlayerFC(input_tensor, mu_w, delta_W)
+          flipoutFC = self.flipoutFC(input_tensor, mu_w, delta_W)
         with tf.name_scope('Wx_plus_b'):
           preactivate = flipoutFC + biases
         if nonlinearity is not None:
@@ -144,42 +149,90 @@ class bayes():
         return preactivate, closed_form_kl()
       return tf.cond(isTrain, lambda: train_forward(), lambda: map_inference())
 
-  def bayesian_nn_layer_LRT(self, input_tensor, input_dim, output_dim, isTrain, layer_name, nonlinearity=None):
+
+  def conv2dFlipout(self, x, W_0, delta_W, weight_shape):
+    num_channels = weight_shape[2]
+    num_filters = weight_shape[3]
+    conv = tf.nn.conv2d(x, W_0, strides=[1, 1, 1, 1], padding='SAME')
+
+    def generate_flipping_factor(dim):
+      shape = tf.stack([tf.shape(x)[0], dim])
+      random = tf.random_normal(shape)
+      positives = tf.ones(shape)
+      negatives = tf.zeros(shape)-1
+      return tf.where(random>0, positives, negatives)
+
+    E1 = generate_flipping_factor(num_filters)
+    E2 = generate_flipping_factor(num_channels)
+
+    E1 = tf.reshape(E1, [-1, 1, 1, num_filters])
+    E2 = tf.reshape(E2, [-1, 1, 1, num_channels])
+
+    flip_x = tf.multiply(x, tf.tile(E2, [1, tf.shape(x)[1], tf.shape(x)[2], 1]))
+    pert_conv = tf.multiply(tf.nn.conv2d(flip_x, delta_W, strides=\
+      [1, 1, 1, 1], padding='SAME'), tf.tile(E1, [1, tf.shape(conv)[1], \
+      tf.shape(conv)[2], 1]))
+    return pert_conv + conv
+
+  def bayesian_conv_layer_flip(self, inputs, weight_shape, isTrain, layer_name, nonlinearity=tf.nn.relu):
     eps = 1e-35
-    with tf.name_scope(layer_name):
-      with tf.name_scope('weights_mean'):
-        mu_w = tf.Variable(tf.random_normal([input_dim, output_dim], stddev=0.1))
-      with tf.name_scope('weights_sd'):
-        rho_w = tf.Variable(tf.random_normal([input_dim, output_dim], mean=-3.0, stddev=0.1))
+    with tf.variable_scope(layer_name):
+      mu_w = tf.get_variable('weights_mean', shape=weight_shape, initializer=initializers.xavier_initializer())
+      rho_w = tf.get_variable('weights_rho', shape=weight_shape, initializer=tf.random_normal_initializer(-3.0, 0.05))
+      biases = tf.get_variable('biases', initializer=tf.zeros([weight_shape[-1]]))
+      with tf.name_scope('weights_std'):
         sigma_w = tf.log(1+tf.exp(rho_w))
-      with tf.name_scope('bias_mean'):
-        biases = tf.Variable(tf.zeros([output_dim]))
 
       def closed_form_kl():
-        dim = input_dim * output_dim
+        dim = tf.cast(tf.size(mu_w), tf.float32)
         return (tf.log(self.w_prior_std)*dim - \
           tf.reduce_sum(tf.log(sigma_w+eps)) + \
           0.5*(-dim+1.0/(self.w_prior_std**2)*(tf.reduce_sum(sigma_w**2) +\
           tf.reduce_sum(mu_w**2))))
 
       def train_forward():
-        mu_b = tf.matmul(input_tensor, mu_w)
-        sigma_b = tf.sqrt(tf.matmul(tf.square(input_tensor), tf.square(sigma_w))+eps)
-        output_shape = tf.stack([tf.shape(input_tensor)[0], output_dim])
-        epsilon = tf.random_normal(output_shape, stddev=1.0)
-        preactivate = mu_b + tf.multiply(sigma_b, epsilon)
-        if nonlinearity is not None:
-          preactivate = nonlinearity(preactivate)
-        return preactivate, closed_form_kl()
+        epsilon_w = tf.random_normal(weight_shape, stddev=1.0)
+        delta_W = tf.multiply(sigma_w, epsilon_w)
+        preactivate = self.conv2dFlipout(inputs, mu_w, delta_W, weight_shape) + biases
+        res = nonlinearity(preactivate)
+        return res, closed_form_kl()
 
       def map_inference():
-        weights = mu_w
-        with tf.name_scope('Wx_plus_b'):
-          preactivate = tf.matmul(input_tensor, weights) + biases
-        if nonlinearity is not None:
-          preactivate = nonlinearity(preactivate)
-        return preactivate, closed_form_kl()
+        preactivate = tf.nn.conv2d(inputs, mu_w, strides=[1, 1, 1, 1], padding='SAME') + biases
+        res = nonlinearity(preactivate)
+        return res, closed_form_kl()
       return tf.cond(isTrain, lambda: train_forward(), lambda: map_inference())
+
+
+  def bayesian_conv_layer(self, inputs, weight_shape, isTrain, layer_name, nonlinearity=tf.nn.relu):
+    eps = 1e-35
+    with tf.variable_scope(layer_name):
+      mu_w = tf.get_variable('weights_mean', shape=weight_shape, initializer=initializers.xavier_initializer())
+      rho_w = tf.get_variable('weights_rho', shape=weight_shape, initializer=tf.random_normal_initializer(-3.0, 0.05))
+      biases = tf.get_variable('biases', initializer=tf.zeros([weight_shape[-1]]))
+      with tf.name_scope('weights_std'):
+        sigma_w = tf.log(1+tf.exp(rho_w))
+
+      def closed_form_kl():
+        dim = tf.cast(tf.size(mu_w), tf.float32)
+        return (tf.log(self.w_prior_std)*dim - \
+          tf.reduce_sum(tf.log(sigma_w+eps)) + \
+          0.5*(-dim+1.0/(self.w_prior_std**2)*(tf.reduce_sum(sigma_w**2) +\
+          tf.reduce_sum(mu_w**2))))
+
+      def train_forward():
+        epsilon_w = tf.random_normal(weight_shape, stddev=1.0)
+        delta_W = tf.multiply(sigma_w, epsilon_w)
+        preactivate = tf.nn.conv2d(inputs, mu_w+delta_W, strides=[1, 1, 1, 1], padding='SAME') + biases
+        res = nonlinearity(preactivate)
+        return res, closed_form_kl()
+
+      def map_inference():
+        preactivate = tf.nn.conv2d(inputs, mu_w, strides=[1, 1, 1, 1], padding='SAME') + biases
+        res = nonlinearity(preactivate)
+        return res, closed_form_kl()
+      return tf.cond(isTrain, lambda: train_forward(), lambda: map_inference())
+
 
   def build_model(self):
     self.isTrain = tf.placeholder(tf.bool, name='isTrain')
@@ -189,29 +242,35 @@ class bayes():
       self.M = tf.placeholder(tf.float32, shape=(), name='number_mini_batches')
       self.n = tf.placeholder(tf.float32, shape=(), name='mini_batch_size')
 
-    if self.args.LRT:
-      hidden1, kl1 = self.bayesian_nn_layer_LRT(self.x , 784, 400, self.isTrain, 'layer1', nonlinearity=tf.nn.relu)
-      hidden2, kl2 = self.bayesian_nn_layer_LRT(hidden1, 400, 400, self.isTrain, 'layer2', nonlinearity=tf.nn.relu)
-      y, kl3 = self.bayesian_nn_layer_LRT(hidden2, 400, 10, self.isTrain, 'layer3')
-    elif self.isFlip:
-      hidden1, kl1 = self.bayesian_nn_layer_flip(self.x , 784, 400, self.isTrain, 'layer1', nonlinearity=tf.nn.relu)
-      hidden2, kl2 = self.bayesian_nn_layer_flip(hidden1, 400, 400, self.isTrain, 'layer2', nonlinearity=tf.nn.relu)
-      y, kl3 = self.bayesian_nn_layer_flip(hidden2, 400, 10, self.isTrain, 'layer3')
+    x = tf.reshape(self.x, [-1, 28, 28, 1])
+    
+    if self.isFlip:
+      x, kl1 = self.bayesian_conv_layer_flip(x, [5,5,1,32], self.isTrain, layer_name='conv1')
+      x = max_pool_2x2(x)
+      x, kl2 = self.bayesian_conv_layer_flip(x, [5,5,32,64], self.isTrain, layer_name='conv2')
+      x = max_pool_2x2(x)
+      x = tf.reshape(x, [-1, 7*7*64])
+      x, kl3 = self.bayesian_nn_layer_flip(x, 7*7*64, 1024, self.isTrain, 'fc1', nonlinearity=tf.nn.relu)
+      y, kl4 = self.bayesian_nn_layer_flip(x, 1024, 10, self.isTrain, 'fc2')
     else:
-      hidden1, kl1 = self.bayesian_nn_layer(self.x , 784, 400, self.isTrain, 'layer1', nonlinearity=tf.nn.relu)
-      hidden2, kl2 = self.bayesian_nn_layer(hidden1, 400, 400, self.isTrain, 'layer2', nonlinearity=tf.nn.relu)
-      y, kl3 = self.bayesian_nn_layer(hidden2, 400, 10, self.isTrain, 'layer3')
+      x, kl1 = self.bayesian_conv_layer(x, [5,5,1,32], self.isTrain, layer_name='conv1')
+      x = max_pool_2x2(x)
+      x, kl2 = self.bayesian_conv_layer(x, [5,5,32,64], self.isTrain, layer_name='conv2')
+      x = max_pool_2x2(x)
+      x = tf.reshape(x, [-1, 7*7*64])
+      x, kl3 = self.bayesian_nn_layer(x , 7*7*64, 1024, self.isTrain, 'fc1', nonlinearity=tf.nn.relu)
+      y, kl4 = self.bayesian_nn_layer(x, 1024, 10, self.isTrain, 'fc2')
 
     with tf.name_scope('cross-entropy'):
       self.cross_entropy = tf.reduce_mean(
           tf.nn.softmax_cross_entropy_with_logits(labels=self.y_, logits=y))
 
     with tf.name_scope('KL'):
-      self.KL = (kl1 + kl2 + kl3) / self.M
+      self.KL = (kl1 + kl2 + kl3 + kl4) / self.M
       # tf.summary.scalar('KL', self.KL)
 
     with tf.name_scope('loss'):
-      self.loss = self.KL + self.cross_entropy
+      self.loss = self.scale * self.KL + self.cross_entropy
       # tf.summary.scalar('loss', self.loss)
 
     with tf.name_scope('train'):
@@ -313,7 +372,7 @@ if __name__ == '__main__':
                       help='scale the KL term')
   parser.add_argument('--batch_size', type=int, default=128,
                       help='minibatch size')
-  parser.add_argument('--num_iterations', type=int, default=30000,
+  parser.add_argument('--num_iterations', type=int, default=6000,
                       help='number of iterations')
   parser.add_argument('--isFlip', action='store_true', default=False,
                       help='whether use flipout')
